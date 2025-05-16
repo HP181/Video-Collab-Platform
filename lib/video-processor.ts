@@ -1,93 +1,218 @@
 // src/lib/video-processor.ts
-import { 
-  PutObjectCommand,
-  GetObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
-import { s3Client, bucketName } from "@/lib/s3-client";
+import { PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs-extra";
+import path from "path";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { s3Client, bucketName } from "@/lib/s3-client"; // Import the shared s3Client and bucketName
+
+const chunkDuration = 10; // Duration for each .ts chunk (in seconds)
 
 /**
- * Generates a basic HLS manifest for streaming
- * In a production environment, you would use AWS MediaConvert or similar service
+ * Uploads a file to S3
  */
-export async function generateHLSContent(videoKey: string): Promise<string> {
+async function uploadToS3(localPath: string, s3Key: string, contentType: string) {
+  console.log(`Uploading ${s3Key} to S3...`);
+  console.log(`Using bucket: ${bucketName}`);
+  
+  const fileStream = fs.createReadStream(localPath);
+  const uploadCommand = new PutObjectCommand({
+    Bucket: bucketName,
+    Key: s3Key,
+    Body: fileStream,
+    ContentType: contentType,
+  });
+
+  await s3Client.send(uploadCommand);
+  console.log(`Successfully uploaded ${s3Key} to S3`);
+}
+
+/**
+ * Downloads a file from S3 to a local path
+ */
+async function downloadFromS3(s3Key: string, localPath: string) {
+  console.log(`Downloading ${s3Key} from S3 to ${localPath}...`);
+  console.log(`Using bucket: ${bucketName}`);
+  
+  // Make sure the directory exists
+  fs.ensureDirSync(path.dirname(localPath));
+  
   try {
-    // For a real implementation, you'd use a service like AWS MediaConvert
-    // to transcode the video and create proper HLS content with multiple
-    // quality levels. This is a simplified version that just creates
-    // a basic manifest file.
+    const getCommand = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: s3Key,
+    });
     
-    // Create the output directory path
-    const hlsBasePath = `hls/${videoKey.split('/').slice(1, -1).join('/')}`;
-    const hlsKey = `${hlsBasePath}/master.m3u8`;
+    console.log(`GetObjectCommand created with Bucket: ${bucketName}, Key: ${s3Key}`);
     
-    // Create a simple master playlist
-    const masterPlaylist = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
-playlist.m3u8`;
+    const response = await s3Client.send(getCommand);
+    console.log(`S3 GetObject response received`);
     
+    if (!response.Body) {
+      throw new Error(`Failed to download file from S3: Empty response body for ${s3Key}`);
+    }
+    
+    // Stream the file to disk
+    await pipeline(
+      response.Body as Readable,
+      fs.createWriteStream(localPath)
+    );
+    
+    console.log(`Successfully downloaded ${s3Key} to ${localPath} (${fs.statSync(localPath).size} bytes)`);
+  } catch (error) {
+    console.error(`Error in downloadFromS3:`, error);
+    console.error(`Bucket: ${bucketName}, Key: ${s3Key}`);
+    throw error;
+  }
+}
+
+/**
+ * Generates HLS content for a given video file
+ */
+export async function generateHLSContent(videoId: string, videoKey: string) {
+  console.log(`Starting HLS content generation for video ${videoId}, S3 key: ${videoKey}`);
+  console.log(`Using S3 bucket: ${bucketName}`);
+  
+  try {
+    if (!videoId || !videoKey) {
+      throw new Error("Both videoId and videoKey are required");
+    }
+
+    if (!bucketName) {
+      throw new Error("S3 bucket name is undefined. Check environment variables.");
+    }
+
+    // Create a temporary file path for the video
+    const fileName = path.basename(videoKey);
+    const tempDir = path.join("/tmp", videoId);
+    const videoLocalPath = path.join(tempDir, fileName);
+    
+    console.log(`Temporary directory: ${tempDir}`);
+    console.log(`Local video path: ${videoLocalPath}`);
+    
+    // Download the video from S3
+    try {
+      await downloadFromS3(videoKey, videoLocalPath);
+    } catch (error: unknown) {
+      console.error(`Error downloading video from S3:`, error);
+      // Handle the error properly with type checking
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Unknown error occurred during download';
+      throw new Error(`Failed to download video from S3: ${errorMessage}`);
+    }
+    
+    // Verify the file exists and has content
+    if (!fs.existsSync(videoLocalPath)) {
+      throw new Error(`Downloaded file ${videoLocalPath} does not exist`);
+    }
+    
+    const fileSize = fs.statSync(videoLocalPath).size;
+    if (fileSize === 0) {
+      throw new Error(`Downloaded file ${videoLocalPath} is empty (0 bytes)`);
+    }
+    
+    console.log(`Downloaded file verified: ${videoLocalPath} (${fileSize} bytes)`);
+
+    // Define HLS output directory
+    const hlsBaseDir = `videos/${videoId}/hls`;
+    const hlsLocalDir = path.join(tempDir, 'hls');
+    fs.ensureDirSync(hlsLocalDir);
+
+    const resolutions = [
+      { name: "720p", width: 1280, height: 720, bitrate: 2800000 },
+      { name: "1080p", width: 1920, height: 1080, bitrate: 5000000 },
+    ];
+
+    let masterPlaylist = "#EXTM3U\n#EXT-X-VERSION:3\n";
+
+    for (const res of resolutions) {
+      const outputDir = path.join(hlsLocalDir, res.name);
+      fs.ensureDirSync(outputDir);
+
+      const playlistPath = path.join(outputDir, "playlist.m3u8");
+      const s3PlaylistKey = `${hlsBaseDir}/${res.name}/playlist.m3u8`;
+
+      // Run ffmpeg to create HLS segments
+      console.log(`Generating HLS for ${res.name}...`);
+      console.log(`Input file: ${videoLocalPath}`);
+      console.log(`Output playlist: ${playlistPath}`);
+      
+      await new Promise((resolve, reject) => {
+        ffmpeg(videoLocalPath)
+          .outputOptions([
+            `-vf scale=${res.width}:${res.height}`,
+            "-c:v h264",
+            `-b:v ${res.bitrate}`,
+            "-c:a aac",
+            "-ar 48000",
+            "-ac 2",
+            "-f hls",
+            `-hls_time ${chunkDuration}`,
+            "-hls_playlist_type vod",
+            `-hls_segment_filename ${outputDir}/chunk%03d.ts`
+          ])
+          .output(playlistPath)
+          .on("start", (commandLine) => {
+            console.log(`FFmpeg started with command: ${commandLine}`);
+          })
+          .on("progress", (progress) => {
+            console.log(`FFmpeg progress: ${JSON.stringify(progress)}`);
+          })
+          .on("end", () => {
+            console.log(`HLS generation for ${res.name} completed successfully`);
+            resolve(true);
+          })
+          .on("error", (err, stdout, stderr) => {
+            console.error(`Error generating HLS for ${res.name}:`, err);
+            console.error(`FFmpeg stdout: ${stdout}`);
+            console.error(`FFmpeg stderr: ${stderr}`);
+            reject(err);
+          })
+          .run();
+      });
+
+      // Upload segments to S3
+      const segmentFiles = fs.readdirSync(outputDir).filter(f => f.endsWith(".ts"));
+      console.log(`Uploading ${segmentFiles.length} segments for ${res.name}...`);
+      
+      for (const segment of segmentFiles) {
+        const localSegmentPath = path.join(outputDir, segment);
+        const s3SegmentKey = `${hlsBaseDir}/${res.name}/${segment}`;
+        await uploadToS3(localSegmentPath, s3SegmentKey, "video/MP2T");
+      }
+
+      // Upload the playlist itself
+      await uploadToS3(playlistPath, s3PlaylistKey, "application/vnd.apple.mpegurl");
+
+      // Add this resolution to the master playlist
+      masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${res.bitrate},RESOLUTION=${res.width}x${res.height}\n${res.name}/playlist.m3u8\n`;
+    }
+
     // Upload the master playlist
-    const masterCommand = new PutObjectCommand({
-      Bucket: bucketName,
-      Key: hlsKey,
-      Body: masterPlaylist,
-      ContentType: 'application/vnd.apple.mpegurl',
-    });
-    
-    await s3Client.send(masterCommand);
-    
-    // Create a simple playlist that points to the original video
-    const playlist = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:60
-#EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:60.0,
-../../${videoKey}
-#EXT-X-ENDLIST`;
-    
-    // Upload the playlist
-    const playlistCommand = new PutObjectCommand({
-      Bucket: bucketName,
-      Key: `${hlsBasePath}/playlist.m3u8`,
-      Body: playlist,
-      ContentType: 'application/vnd.apple.mpegurl',
-    });
-    
-    await s3Client.send(playlistCommand);
-    
-    return hlsKey;
+    const masterKey = `${hlsBaseDir}/master.m3u8`;
+    const masterPath = path.join(hlsLocalDir, "master.m3u8");
+    fs.writeFileSync(masterPath, masterPlaylist);
+    await uploadToS3(masterPath, masterKey, "application/vnd.apple.mpegurl");
+
+    // Clean up temp files
+    try {
+      fs.removeSync(tempDir);
+      console.log(`Cleaned up temporary directory ${tempDir}`);
+    } catch (error: unknown) {
+      // Handle the cleanup error with proper type checking
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Unknown error';
+      console.warn(`Warning: Failed to clean up temp directory: ${errorMessage}`);
+      // Continue execution even if cleanup fails
+    }
+
+    console.log("HLS content generated successfully. Master playlist key:", masterKey);
+    return hlsBaseDir;
   } catch (error) {
-    console.error('Error generating HLS content:', error);
+    console.error("Error generating HLS content:", error);
     throw error;
   }
-}
-
-/**
- * Generates a temporary public URL for video playback
- */
-export async function generateVideoUrl(videoKey: string, expiresIn = 3600): Promise<string> {
-  try {
-    // For a more production-ready implementation, consider using CloudFront
-    // signed URLs instead of direct S3 access
-    
-    const command = new GetObjectCommand({
-      Bucket: bucketName,
-      Key: videoKey,
-    });
-    
-    const url = await getSignedUrl(s3Client, command, { expiresIn });
-    return url;
-  } catch (error) {
-    console.error('Error generating video URL:', error);
-    throw error;
-  }
-}
-
-/**
- * Gets a signed URL with CORS headers for streaming
- */
-async function getSignedUrl(client: S3Client, command: any, options: any): Promise<string> {
-  const { getSignedUrl } = await import('@aws-sdk/s3-request-presigner');
-  return getSignedUrl(client, command, options);
 }

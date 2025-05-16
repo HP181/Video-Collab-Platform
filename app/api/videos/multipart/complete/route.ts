@@ -1,208 +1,168 @@
 // src/app/api/videos/multipart/complete/route.ts
 import { NextResponse } from "next/server";
-import { 
-  CompleteMultipartUploadCommand,
+import {
   CopyObjectCommand,
-  PutObjectAclCommand
+  DeleteObjectCommand,
+  CompleteMultipartUploadCommand
 } from "@aws-sdk/client-s3";
 import { auth } from "@clerk/nextjs/server";
 import connectToDatabase from "@/lib/mongodb";
 import { Video } from "@/models/video";
 import { s3Client, bucketName } from "@/lib/s3-client";
-import { revalidatePath } from "next/cache";
 import { generateHLSContent } from "@/lib/video-processor";
+
+// Define the types for multipart upload parts
+interface UploadPart {
+  ETag: string;
+  PartNumber: number;
+}
 
 export async function POST(req: Request) {
   try {
-    console.log("Complete multipart upload request received");
+    console.log("🔒 Authenticating user...");
     const { userId } = await auth();
-    
     if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        { status: 401 }
-      );
+      console.log("❌ Unauthorized access attempt.");
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    
-    // Check content type for debugging
-    const contentType = req.headers.get('content-type');
-    console.log("Request content type:", contentType);
-    
+
+    console.log("🗄️ Connecting to the database...");
+    await connectToDatabase();
+
+    console.log("📦 Parsing request body...");
     let requestData;
     try {
       requestData = await req.json();
-      console.log("Request data:", requestData);
+      console.log("✅ Request data parsed successfully:", requestData);
     } catch (parseError) {
-      console.error("Error parsing request body:", parseError);
+      console.error("❌ Error parsing request body:", parseError);
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+
+    const { videoId, key, uploadId, parts } = requestData;
+    if (!videoId || !key || !uploadId || !parts || parts.length === 0) {
+      console.log("❌ Missing required parameters:", { videoId, key, uploadId, parts });
       return NextResponse.json(
-        { error: "Invalid request body" },
+        { error: "Missing required parameters: videoId, key, uploadId, and parts are required" },
         { status: 400 }
       );
     }
-    
-    const { 
-      uploadId,
-      key,
-      videoId,
-      parts, // Array of { ETag, PartNumber } objects from successful part uploads
-    } = requestData;
-    
-    if (!uploadId || !key || !videoId || !parts || !Array.isArray(parts)) {
-      console.error("Missing required parameters:", { uploadId, key, videoId, partsLength: parts?.length });
-      return NextResponse.json(
-        { error: "Missing required parameters" },
-        { status: 400 }
-      );
+
+    console.log("🔍 Checking if the video exists in the database...");
+    const existingVideo = await Video.findById(videoId);
+    if (!existingVideo) {
+      console.log("❌ Video not found:", videoId);
+      return NextResponse.json({ error: "Video not found" }, { status: 404 });
     }
-    
-    console.log(`Completing upload for videoId: ${videoId}, uploadId: ${uploadId}, with ${parts.length} parts`);
-    
-    // Validate parts array
-    if (parts.length === 0) {
-      return NextResponse.json(
-        { error: "No parts provided" },
-        { status: 400 }
-      );
-    }
-    
-    // Verify all parts have ETag and PartNumber
-    const validParts = parts.every(part => part.ETag && part.PartNumber);
-    if (!validParts) {
-      console.error("Invalid parts data:", parts);
-      return NextResponse.json(
-        { error: "Invalid parts data" },
-        { status: 400 }
-      );
-    }
-    
-    // Ensure parts are sorted by part number
-    parts.sort((a, b) => a.PartNumber - b.PartNumber);
-    
-    // Validate that the upload exists and belongs to this user
-    console.log("Connecting to database...");
-    await connectToDatabase();
-    
-    console.log("Finding video document...");
-    const video = await Video.findOne({
-      _id: videoId,
-      uploadId,
-      uploadedById: userId
-    });
-    
-    if (!video) {
-      console.error("Video not found or unauthorized:", { videoId, uploadId, userId });
-      return NextResponse.json(
-        { error: "Upload not found or unauthorized" },
-        { status: 404 }
-      );
-    }
-    
-    console.log("Found video document:", video._id);
-    
-    // Update video status to processing
-    console.log("Updating video status to processing...");
-    await Video.findByIdAndUpdate(videoId, {
-      status: "processing",
-    });
-    
-    // Complete the multipart upload
-    console.log("Completing multipart upload in S3...");
+
+    // First, complete the multipart upload to finalize the object in S3
     try {
+      console.log("🧩 Completing multipart upload in S3...");
+      
+      // Sort parts with proper TypeScript typing
+      const sortedParts = [...parts].sort((a: UploadPart, b: UploadPart) => a.PartNumber - b.PartNumber);
+      
       const completeCommand = new CompleteMultipartUploadCommand({
         Bucket: bucketName,
         Key: key,
         UploadId: uploadId,
         MultipartUpload: {
-          Parts: parts,
-        },
+          Parts: sortedParts
+        }
       });
       
       const completeResponse = await s3Client.send(completeCommand);
-      console.log("Multipart upload completed:", completeResponse);
-    } catch (s3Error: any) {
-      console.error("Error completing multipart upload:", s3Error);
+      console.log("✅ Multipart upload completed in S3:", completeResponse.Location);
       
-      // Even if there's an error with S3, let's try to proceed if possible
-      console.warn("Attempting to continue despite S3 error");
+      // Update the database with the processing status
+      await Video.findByIdAndUpdate(videoId, {
+        status: "processing",
+      });
+      
+    } catch (s3CompleteError) {
+      console.error("❌ S3 multipart completion failed:", s3CompleteError);
+      await Video.findByIdAndUpdate(videoId, { 
+        status: "error", 
+        errorMessage: "Failed to complete S3 multipart upload" 
+      });
+      return NextResponse.json({ 
+        error: "Failed to complete S3 multipart upload",
+        details: s3CompleteError instanceof Error ? s3CompleteError.message : "Unknown error"
+      }, { status: 500 });
     }
-    
-    // After successful upload, move the file to the videos folder
-    const finalKey = `videos/${video._id}/${video.fileName}`;
-    
-    // Generate HLS content for streaming
-    let hlsKey;
-    
+
+    console.log("📁 Defining final storage location...");
+    const finalKey = `videos/${videoId}/${existingVideo.fileName}`;
+    console.log("🗂️ Final S3 key:", finalKey);
+
     try {
-      console.log("Moving uploaded file to final location...");
-      const copyCommand = new CopyObjectCommand({
+      console.log("🚚 Moving uploaded file to final location...");
+      console.log("📝 Copy source:", `${bucketName}/${key}`);
+      
+      await s3Client.send(new CopyObjectCommand({
         Bucket: bucketName,
         CopySource: `${bucketName}/${key}`,
         Key: finalKey,
+      }));
+
+      console.log("✅ File successfully copied to final location");
+
+      console.log("🗑️ Deleting the temporary upload...");
+      await s3Client.send(new DeleteObjectCommand({
+        Bucket: bucketName,
+        Key: key,
+      }));
+      console.log("✅ Temporary upload deleted:", key);
+    } catch (s3Error) {
+      console.error("❌ S3 operation failed:", s3Error);
+      await Video.findByIdAndUpdate(videoId, { 
+        status: "error", 
+        errorMessage: "S3 file operation failed: " + (s3Error instanceof Error ? s3Error.message : String(s3Error))
       });
-      
-      await s3Client.send(copyCommand);
-      console.log("File moved to:", finalKey);
-      
-      // Generate HLS content for streaming
-      console.log("Generating HLS content...");
-      hlsKey = await generateHLSContent(finalKey);
-      console.log("HLS content generated at:", hlsKey);
-    } catch (processingError) {
-      console.error("Error in post-upload processing:", processingError);
-      
-      // Update video with error status
-      await Video.findByIdAndUpdate(videoId, {
-        status: "error",
-        processingError: "Failed to process video after upload"
-      });
-      
-      return NextResponse.json(
-        { error: "Failed to process video after upload" },
-        { status: 500 }
-      );
+      return NextResponse.json({ 
+        error: "Failed to process video in storage",
+        details: s3Error instanceof Error ? s3Error.message : "Unknown error"
+      }, { status: 500 });
     }
-    
-    // Update the video record
-    console.log("Updating video record with final data...");
-    await Video.findByIdAndUpdate(videoId, {
-      status: "ready",
-      videoKey: finalKey,
-      hlsKey,
-      uploadCompletedAt: new Date(),
-    });
-    
-    // Revalidate paths to update UI
-    console.log("Revalidating paths...");
-    revalidatePath(`/workspaces/${video.workspaceId}`);
-    
-    return NextResponse.json({
-      success: true,
-      videoId,
-      videoKey: finalKey,
-      hlsKey,
-    });
-  } catch (error: any) {
-    console.error("Unhandled error in complete endpoint:", error);
-    
+
     try {
-      // Update video status to error
-      const { videoId } = await req.json();
-      if (videoId) {
-        await Video.findByIdAndUpdate(videoId, {
-          status: "error",
-          processingError: error.message || "Failed to complete upload",
-        });
-      }
-    } catch (e) {
-      // Ignore error during error handling
+      console.log("🎥 Generating HLS content for streaming...");
+      const hlsKey = await generateHLSContent(videoId, finalKey);
+      console.log("✅ HLS content generated successfully:", hlsKey);
+
+      console.log("📝 Updating video record in the database...");
+      await Video.findByIdAndUpdate(videoId, {
+        status: "ready",
+        videoKey: finalKey,
+        hlsKey,
+        uploadCompletedAt: new Date(),
+      });
+
+      console.log("✅ Video processing completed successfully:", { videoId, videoKey: finalKey, hlsKey });
+      return NextResponse.json({ 
+        success: true, 
+        videoId, 
+        videoKey: finalKey, 
+        hlsKey,
+        message: "Video processing completed successfully"
+      });
+    } catch (processingError) {
+      console.error("❌ Video processing failed:", processingError);
+      await Video.findByIdAndUpdate(videoId, { 
+        status: "error", 
+        errorMessage: "Video processing failed: " + 
+          (processingError instanceof Error ? processingError.message : String(processingError))
+      });
+      return NextResponse.json({ 
+        error: "Failed to process video content",
+        details: processingError instanceof Error ? processingError.message : "Unknown error"
+      }, { status: 500 });
     }
-    
-    return NextResponse.json(
-      { 
-        error: error.message || "Failed to complete multipart upload",
-        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-      },
-      { status: 500 }
-    );
+  } catch (error) {
+    console.error("❌ Unhandled error in complete endpoint:", error);
+    return NextResponse.json({ 
+      error: "Failed to complete multipart upload", 
+      message: error instanceof Error ? error.message : "Unknown error"
+    }, { status: 500 });
   }
 }

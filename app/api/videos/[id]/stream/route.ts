@@ -1,93 +1,85 @@
 // src/app/api/videos/[id]/stream/route.ts
 import { NextResponse } from "next/server";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { auth } from "@clerk/nextjs/server";
 import connectToDatabase from "@/lib/mongodb";
 import { Video } from "@/models/video";
-import { GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { s3Client, bucketName } from "@/lib/s3-client";
+import { getUserMembership } from "@/lib/UserMembership"; // You'll need to create this
 
-export async function GET(
-  req: Request,
-  { params }: { params: { id: string } }
-) {
+export async function GET(req: Request, { params }: { params: { id: string } }) {
   try {
-    console.log(`Stream request received for video ID: ${params.id}`);
-    
     const { userId } = await auth();
-    
     if (!userId) {
-      console.error("Unauthorized request to stream video");
-      return new NextResponse('Unauthorized', { status: 401 });
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    
+
+    // Connect to the database
+    await connectToDatabase();
+
+    // Get video information
     const param = await params
     const videoId = param.id;
-    console.log(`Looking up video with ID: ${videoId}`);
-    
-    await connectToDatabase();
-    
-    // Find the video
-    const video = await Video.findById(videoId);
-    
+    const video = await Video.findOne({
+      _id: videoId,
+      status: "ready"
+    });
+
     if (!video) {
-      console.error(`Video not found: ${videoId}`);
-      return new NextResponse('Video not found', { status: 404 });
+      return NextResponse.json({ error: "Video not found or not ready" }, { status: 404 });
     }
-    
-    console.log(`Found video: ${video.title}, status: ${video.status}`);
-    
-    // Check if the video is ready
-    if (video.status !== 'ready') {
-      console.error(`Video not ready for streaming: ${video.status}`);
-      return new NextResponse('Video is not ready for streaming', { status: 400 });
-    }
-    
-    // Check if the video has HLS content
-    if (!video.hlsKey) {
-      console.error(`Video has no HLS key: ${videoId}`);
-      
-      // If video has a direct videoKey but no HLS key, return a direct link
-      if (video.videoKey) {
-        console.log(`Returning direct video link instead of HLS`);
-        const directCommand = new GetObjectCommand({
-          Bucket: bucketName,
-          Key: video.videoKey,
-        });
-        
-        const directUrl = await getSignedUrl(s3Client, directCommand, { 
-          expiresIn: 3600, // 1 hour
-        });
-        
-        return NextResponse.json({ url: directUrl, isHLS: false });
-      }
-      
-      return new NextResponse('Video streaming manifest not found', { status: 404 });
-    }
-    
-    console.log(`Generating pre-signed URL for HLS key: ${video.hlsKey}`);
-    
-    // Generate a pre-signed URL for the HLS manifest
-    const command = new GetObjectCommand({
-      Bucket: bucketName,
-      Key: video.hlsKey,
-    });
-    
-    const url = await getSignedUrl(s3Client, command, { 
-      expiresIn: 3600, // 1 hour
-    });
-    
-    console.log(`Generated streaming URL (truncated): ${url.substring(0, 50)}...`);
-    
+
     // Increment view count
-    await Video.findByIdAndUpdate(videoId, {
-      $inc: { viewCount: 1 }
-    });
-    
-    // Return the URL
-    return NextResponse.json({ url, isHLS: true });
-  } catch (error: any) {
-    console.error('Error getting video stream:', error);
-    return new NextResponse(`Error: ${error.message}`, { status: 500 });
+    await Video.findByIdAndUpdate(videoId, { $inc: { viewCount: 1 } });
+
+    // Get user's membership status
+    const { isPaidMember } = await getUserMembership(userId);
+
+    // Determine if we should use HLS or direct video
+    let streamUrl;
+    let isHLS = true;
+
+    if (video.hlsKey) {
+      // Generate a presigned URL for the master playlist
+      const masterPlaylistKey = `${video.hlsKey}/master.m3u8`;
+      
+      const command = new GetObjectCommand({
+        Bucket: bucketName,
+        Key: masterPlaylistKey,
+      });
+      
+      streamUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+      
+      // Record the user's quality permission in the response
+      const userAllowedHD = isPaidMember;
+      
+      return NextResponse.json({
+        url: streamUrl,
+        isHLS: true,
+        allowedQuality: userAllowedHD ? "1080p" : "720p"
+      });
+    } else if (video.videoKey) {
+      // Fallback to direct video if HLS is not available
+      const command = new GetObjectCommand({
+        Bucket: bucketName,
+        Key: video.videoKey,
+      });
+      
+      streamUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+      
+      return NextResponse.json({
+        url: streamUrl,
+        isHLS: false
+      });
+    } else {
+      return NextResponse.json({ error: "Video has no playable content" }, { status: 404 });
+    }
+  } catch (error) {
+    console.error("Error getting video stream:", error);
+    return NextResponse.json(
+      { error: "Failed to get streaming URL" },
+      { status: 500 }
+    );
   }
 }

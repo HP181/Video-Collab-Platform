@@ -68,15 +68,19 @@ export default async function WorkspacePage({ params }: WorkspacePageProps) {
           {isOwner && <TabsTrigger value="settings">Settings</TabsTrigger>}
         </TabsList>
 
-       <TabsContent value="videos">
+      <TabsContent value="videos">
   <Suspense fallback={<VideosSkeleton />}>
     <WorkspaceVideos
       workspaceId={workspace._id.toString()}
       slug={workspace.slug}
       isOwner={!!isOwner}
     />
+    {isOwner && (
+      <S3MultipartUploadForm workspaceId={workspace._id.toString()} />
+    )}
   </Suspense>
 </TabsContent>
+
 
      <TabsContent value="members">
           <Suspense fallback={<MembersSkeleton />}>

@@ -2,364 +2,481 @@
 
 import { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { Play, Pause, Volume2, VolumeX, Maximize, Settings } from "lucide-react";
-import { Slider } from "@/components/ui/slider";
-import { Button } from "@/components/ui/button";
+import { Play, Pause, Volume2, VolumeX, Maximize, Settings, Crown } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { useUserMembership } from "@/lib/UseUserMembership";
 
-interface VideoPlayerProps {
+interface S3VideoPlayerProps {
   hlsUrl: string;
-  poster?: string;
-  title?: string;
-  isHls?: boolean; // Add flag for HLS vs direct video
+  title: string;
+  isHls?: boolean;
 }
 
-export function S3VideoPlayer({ hlsUrl, poster, title, isHls = true }: VideoPlayerProps) {
+export function S3VideoPlayer({ hlsUrl, title, isHls = true }: S3VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const videoContainerRef = useRef<HTMLDivElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const controlsTimeout = useRef<NodeJS.Timeout | null>(null);
+  const [videoReady, setVideoReady] = useState(false);
+  
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
-  const [volume, setVolume] = useState(1);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [volume, setVolume] = useState(1);
   const [showControls, setShowControls] = useState(true);
-  const [isBuffering, setIsBuffering] = useState(false);
-  const hideControlsTimeout = useRef<NodeJS.Timeout>();
-  const hlsInstance = useRef<Hls | null>(null);
+  const [buffering, setBuffering] = useState(false);
+  const [selectedQuality, setSelectedQuality] = useState<string>("auto");
+  const [availableQualities, setAvailableQualities] = useState<string[]>([]);
+  const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
 
-  // Initialize player based on URL type
+  // Get the user's membership status
+  const { isPaidMember } = useUserMembership();
+  
+  // Format time (seconds) to MM:SS
+  const formatTime = (time: number) => {
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    return `${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
+  };
+  
+  // Handle direct video or HLS source
   useEffect(() => {
-    let hls: Hls | null = null;
-    const video = videoRef.current;
+    if (!videoRef.current) return;
     
-    if (!video || !hlsUrl) return;
-    
-    console.log(`Initializing video player with URL: ${hlsUrl.substring(0, 50)}...`);
-    console.log(`Using HLS: ${isHls}`);
-    
-    // Clean up any existing HLS instance
-    if (hlsInstance.current) {
-      hlsInstance.current.destroy();
-      hlsInstance.current = null;
+    // Reset state
+    setVideoReady(false);
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
     }
     
-    const initializeVideo = async () => {
-      // For direct video URL (not HLS)
-      if (!isHls) {
-        console.log("Using direct video URL");
-        video.src = hlsUrl;
-        return;
-      }
-      
-      // For HLS content
-      // First check if HLS is supported natively
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Native HLS support (Safari)
-        console.log("Using native HLS support");
-        video.src = hlsUrl;
-      } else if (Hls.isSupported()) {
-        // Use HLS.js for other browsers
-        console.log("Using HLS.js");
-        hls = new Hls({
-          maxBufferLength: 30,
+    const video = videoRef.current;
+    
+    if (isHls) {
+      // Handle HLS (adaptive streaming)
+      if (Hls.isSupported()) {
+        const hls = new Hls({
           maxMaxBufferLength: 60,
-          debug: true, // Enable debug logs
+          manifestLoadingTimeOut: 10000,
         });
         
         hls.loadSource(hlsUrl);
         hls.attachMedia(video);
-        hlsInstance.current = hls;
         
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          console.log("HLS manifest parsed successfully");
-          if (video) {
-            setDuration(video.duration);
+        hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+          console.log("HLS manifest parsed, levels:", data.levels);
+          
+          // Get available quality levels
+          const parsedLevels = data.levels.map((level) => {
+            const height = level.height;
+            return height ? `${height}p` : "Unknown";
+          });
+          
+          setAvailableQualities(["auto", ...parsedLevels]);
+          
+          // For non-paid members, set the initial quality to 720p
+          if (!isPaidMember && parsedLevels.includes("1080p")) {
+            console.log("Non-paid member - forcing 720p quality");
+            
+            // Find the index of the 720p level
+            const quality720Index = hls.levels.findIndex(level => level.height === 720);
+            if (quality720Index !== -1) {
+              // Set the quality to 720p
+              hls.currentLevel = quality720Index;
+              setSelectedQuality("720p");
+            }
           }
+          
+          setVideoReady(true);
         });
         
-        hls.on(Hls.Events.ERROR, (_, data) => {
-          console.error('HLS error:', data);
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          console.error("HLS error:", data);
           if (data.fatal) {
-            switch (data.type) {
+            switch(data.type) {
               case Hls.ErrorTypes.NETWORK_ERROR:
-                console.log("Fatal network error, trying to recover");
-                hls?.startLoad();
+                console.log("Network error, trying to recover...");
+                hls.startLoad();
                 break;
               case Hls.ErrorTypes.MEDIA_ERROR:
-                console.log("Fatal media error, trying to recover");
-                hls?.recoverMediaError();
+                console.log("Media error, trying to recover...");
+                hls.recoverMediaError();
                 break;
               default:
-                console.error("Fatal error, cannot recover", data);
+                console.error("Fatal error, destroying HLS instance");
+                hls.destroy();
                 break;
             }
           }
         });
-      } else {
-        console.error('HLS is not supported in this browser and no fallback provided');
+        
+        hlsRef.current = hls;
+      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        // Native HLS support (Safari)
+        video.src = hlsUrl;
+        setVideoReady(true);
+      }
+    } else {
+      // Direct video source
+      video.src = hlsUrl;
+      setVideoReady(true);
+    }
+    
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
       }
     };
+  }, [hlsUrl, isHls, isPaidMember]);
+  
+  // Handle play/pause
+  const togglePlay = () => {
+    if (!videoRef.current) return;
     
-    initializeVideo();
+    if (isPlaying) {
+      videoRef.current.pause();
+    } else {
+      videoRef.current.play();
+    }
+  };
+  
+  // Handle mute/unmute
+  const toggleMute = () => {
+    if (!videoRef.current) return;
     
-    return () => {
-      if (hls) {
-        hls.destroy();
-      }
-    };
-  }, [hlsUrl, isHls]);
-
-  // Handle video events
-  useEffect(() => {
-    const video = videoRef.current;
-    
-    if (!video) return;
-    
-    const handlePlay = () => setIsPlaying(true);
-    const handlePause = () => setIsPlaying(false);
-    const handleTimeUpdate = () => setCurrentTime(video.currentTime);
-    const handleDurationChange = () => setDuration(video.duration);
-    const handleVolumeChange = () => {
-      setVolume(video.volume);
-      setIsMuted(video.muted);
-    };
-    const handleWaiting = () => setIsBuffering(true);
-    const handlePlaying = () => setIsBuffering(false);
-    const handleLoadedData = () => setIsBuffering(false);
-    
-    video.addEventListener('play', handlePlay);
-    video.addEventListener('pause', handlePause);
-    video.addEventListener('timeupdate', handleTimeUpdate);
-    video.addEventListener('durationchange', handleDurationChange);
-    video.addEventListener('volumechange', handleVolumeChange);
-    video.addEventListener('waiting', handleWaiting);
-    video.addEventListener('playing', handlePlaying);
-    video.addEventListener('loadeddata', handleLoadedData);
-    
-    return () => {
-      video.removeEventListener('play', handlePlay);
-      video.removeEventListener('pause', handlePause);
-      video.removeEventListener('timeupdate', handleTimeUpdate);
-      video.removeEventListener('durationchange', handleDurationChange);
-      video.removeEventListener('volumechange', handleVolumeChange);
-      video.removeEventListener('waiting', handleWaiting);
-      video.removeEventListener('playing', handlePlaying);
-      video.removeEventListener('loadeddata', handleLoadedData);
-    };
-  }, []);
-
-  // Handle fullscreen changes
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsFullscreen(!!document.fullscreenElement);
-    };
-    
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-    };
-  }, []);
-
-  // Handle control visibility
-  useEffect(() => {
-    const container = videoContainerRef.current;
-    
-    if (!container) return;
-    
-    const handleMouseMove = () => {
-      setShowControls(true);
+    if (isMuted) {
+      videoRef.current.muted = false;
+      setIsMuted(false);
       
-      if (hideControlsTimeout.current) {
-        clearTimeout(hideControlsTimeout.current);
+      // Restore previous volume
+      if (volume === 0) {
+        setVolume(0.5);
+        videoRef.current.volume = 0.5;
       }
-      
-      if (isPlaying) {
-        hideControlsTimeout.current = setTimeout(() => {
-          setShowControls(false);
-        }, 3000);
-      }
-    };
+    } else {
+      videoRef.current.muted = true;
+      setIsMuted(true);
+    }
+  };
+  
+  // Handle volume change
+  const handleVolumeChange = (value: number[]) => {
+    if (!videoRef.current) return;
     
-    const handleMouseLeave = () => {
+    const newVolume = value[0];
+    videoRef.current.volume = newVolume;
+    setVolume(newVolume);
+    
+    // Update mute state based on volume
+    if (newVolume === 0) {
+      videoRef.current.muted = true;
+      setIsMuted(true);
+    } else if (isMuted) {
+      videoRef.current.muted = false;
+      setIsMuted(false);
+    }
+  };
+  
+  // Handle time scrubbing
+  const handleTimeChange = (value: number[]) => {
+    if (!videoRef.current) return;
+    
+    const newTime = value[0];
+    videoRef.current.currentTime = newTime;
+    setCurrentTime(newTime);
+  };
+  
+  // Handle fullscreen
+  const toggleFullscreen = () => {
+    if (!wrapperRef.current) return;
+    
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      wrapperRef.current.requestFullscreen();
+    }
+  };
+  
+  // Handle quality change
+  const changeQuality = (level: string) => {
+    if (!hlsRef.current || !isHls) return;
+    
+    // Don't allow non-paid members to select 1080p
+    if (level === "1080p" && !isPaidMember) {
+      // Show premium upgrade dialog
+      setShowUpgradeDialog(true);
+      return;
+    }
+    
+    setSelectedQuality(level);
+    
+    if (level === "auto") {
+      hlsRef.current.currentLevel = -1; // Auto quality
+    } else {
+      // Find the level index that matches the selected quality
+      const levelIndex = hlsRef.current.levels.findIndex(
+        l => l.height === parseInt(level.replace("p", ""))
+      );
+      
+      if (levelIndex !== -1) {
+        hlsRef.current.currentLevel = levelIndex;
+      }
+    }
+  };
+  
+  // Show/hide controls on mouse movement
+  const handleMouseMove = () => {
+    setShowControls(true);
+    
+    if (controlsTimeout.current) {
+      clearTimeout(controlsTimeout.current);
+    }
+    
+    controlsTimeout.current = setTimeout(() => {
       if (isPlaying) {
         setShowControls(false);
       }
-    };
+    }, 3000);
+  };
+  
+  // Event listeners for video element
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
     
-    container.addEventListener('mousemove', handleMouseMove);
-    container.addEventListener('mouseleave', handleMouseLeave);
+    const onPlay = () => setIsPlaying(true);
+    const onPause = () => setIsPlaying(false);
+    const onVolumeChange = () => {
+      setVolume(video.volume);
+      setIsMuted(video.muted);
+    };
+    const onTimeUpdate = () => setCurrentTime(video.currentTime);
+    const onLoadedMetadata = () => setDuration(video.duration);
+    const onWaiting = () => setBuffering(true);
+    const onPlaying = () => setBuffering(false);
+    
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("volumechange", onVolumeChange);
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("playing", onPlaying);
     
     return () => {
-      container.removeEventListener('mousemove', handleMouseMove);
-      container.removeEventListener('mouseleave', handleMouseLeave);
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("volumechange", onVolumeChange);
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("playing", onPlaying);
       
-      if (hideControlsTimeout.current) {
-        clearTimeout(hideControlsTimeout.current);
+      if (controlsTimeout.current) {
+        clearTimeout(controlsTimeout.current);
       }
     };
-  }, [isPlaying]);
-
-  // Play/pause control
-  const togglePlay = () => {
-    const video = videoRef.current;
-    
-    if (!video) return;
-    
-    if (video.paused) {
-      video.play();
-    } else {
-      video.pause();
-    }
-  };
-
-  // Mute/unmute control
-  const toggleMute = () => {
-    const video = videoRef.current;
-    
-    if (!video) return;
-    
-    video.muted = !video.muted;
-  };
-
-  // Volume control
-  const handleVolumeChange = (value: number[]) => {
-    const video = videoRef.current;
-    
-    if (!video) return;
-    
-    const newVolume = value[0];
-    video.volume = newVolume;
-    
-    if (newVolume === 0) {
-      video.muted = true;
-    } else if (video.muted) {
-      video.muted = false;
-    }
-  };
-
-  // Time control
-  const handleTimeChange = (value: number[]) => {
-    const video = videoRef.current;
-    
-    if (!video) return;
-    
-    video.currentTime = value[0];
-  };
-
-  // Fullscreen control
-  const toggleFullscreen = () => {
-    const container = videoContainerRef.current;
-    
-    if (!container) return;
-    
-    if (!document.fullscreenElement) {
-      container.requestFullscreen().catch(err => {
-        console.error(`Error attempting to enable fullscreen: ${err.message}`);
-      });
-    } else {
-      document.exitFullscreen();
-    }
-  };
-
-  // Format time (seconds to MM:SS)
-  const formatTime = (seconds: number) => {
-    if (isNaN(seconds)) return "0:00";
-    
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = Math.floor(seconds % 60);
-    
-    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
-  };
-
+  }, []);
+  
   return (
     <div 
-      ref={videoContainerRef}
-      className={cn(
-        "relative overflow-hidden bg-black rounded-lg group",
-        isFullscreen ? "fixed inset-0 z-50" : "aspect-video"
-      )}
+      ref={wrapperRef}
+      className="relative w-full aspect-video bg-black rounded-lg overflow-hidden"
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => isPlaying && setShowControls(false)}
     >
       <video
         ref={videoRef}
-        poster={poster}
+        className="w-full h-full"
         playsInline
-        className="w-full h-full object-contain"
+        preload="auto"
         onClick={togglePlay}
+        onDoubleClick={toggleFullscreen}
       />
       
-      {/* Loading indicator */}
-      {isBuffering && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-          <div className="animate-spin rounded-full h-10 w-10 border-4 border-t-primary" />
+      {/* Premium Upgrade Dialog */}
+      <Dialog open={showUpgradeDialog} onOpenChange={setShowUpgradeDialog}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center">
+              <Crown className="h-5 w-5 text-yellow-500 mr-2" />
+              Upgrade to Premium
+            </DialogTitle>
+            <DialogDescription>
+              Unlock HD 1080p quality and other premium features by upgrading your membership.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <h3 className="font-medium">Premium Benefits:</h3>
+              <ul className="list-disc pl-5 text-sm space-y-1">
+                <li>Watch all videos in HD 1080p quality</li>
+                <li>Access to exclusive premium content</li>
+                <li>Ad-free viewing experience</li>
+                <li>Priority support</li>
+              </ul>
+            </div>
+            <div className="bg-muted p-3 rounded-md">
+              <p className="text-sm font-medium mb-1">Only $9.99/month</p>
+              <p className="text-xs text-muted-foreground">Cancel anytime. No commitments.</p>
+            </div>
+          </div>
+          <div className="flex justify-between">
+            <Button variant="outline" onClick={() => setShowUpgradeDialog(false)}>
+              Not Now
+            </Button>
+            <Button className="bg-primary hover:bg-primary/90">
+              Upgrade Now
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      
+      {/* Loading/buffering spinner */}
+      {(!videoReady || buffering) && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="w-12 h-12 rounded-full border-4 border-primary border-t-transparent animate-spin" />
         </div>
       )}
       
-      {/* Play/pause overlay button */}
-      <Button
-        variant="ghost"
-        size="icon"
-        className={cn(
-          "absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2",
-          "h-16 w-16 rounded-full bg-primary/20 opacity-0",
-          "transition-opacity duration-300",
-          "group-hover:opacity-100",
-          !isPlaying && "opacity-100",
-          !showControls && "opacity-0"
-        )}
-        onClick={togglePlay}
-      >
-        {isPlaying ? (
-          <Pause className="h-8 w-8 text-white" />
-        ) : (
-          <Play className="h-8 w-8 text-white" />
-        )}
-      </Button>
+      {/* Big play button */}
+      {!isPlaying && videoReady && (
+        <div 
+          className="absolute inset-0 flex items-center justify-center cursor-pointer"
+          onClick={togglePlay}
+        >
+          <div className="w-20 h-20 rounded-full bg-primary/80 flex items-center justify-center">
+            <Play className="w-10 h-10 text-primary-foreground" fill="currentColor" />
+          </div>
+        </div>
+      )}
       
-      {/* Controls bar */}
-      <div
+      {/* Controls overlay */}
+      <div 
         className={cn(
-          "absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/80 to-transparent",
-          "transition-opacity duration-300",
-          showControls ? "opacity-100" : "opacity-0"
+          "absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 pb-4 pt-12 transition-opacity duration-300",
+          showControls ? "opacity-100" : "opacity-0 pointer-events-none"
         )}
       >
+        {/* Title bar */}
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-white text-sm font-medium truncate">{title}</h3>
+          
+          <div className="flex items-center gap-2">
+            {/* Quality selector - only show for HLS */}
+            {isHls && availableQualities.length > 0 && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-white/20">
+                          <Settings className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {availableQualities.map((quality) => (
+                          <DropdownMenuItem
+                            key={quality}
+                            onClick={() => changeQuality(quality)}
+                            className={cn(
+                              selectedQuality === quality && "font-medium bg-accent",
+                              quality === "1080p" && !isPaidMember && "text-muted-foreground cursor-not-allowed"
+                            )}
+                            disabled={quality === "1080p" && !isPaidMember}
+                          >
+                            {quality === "1080p" && !isPaidMember ? (
+                              <div className="flex items-center justify-between w-full">
+                                <span>{quality}</span>
+                                <span className="ml-1 text-xs flex items-center text-amber-500">
+                                  <Crown className="h-3 w-3 mr-1" />
+                                  Premium
+                                </span>
+                              </div>
+                            ) : (
+                              quality
+                            )}
+                          </DropdownMenuItem>
+                        ))}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    <p>Quality</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
+            
+            {/* Fullscreen button */}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button 
+                    variant="ghost" 
+                    size="icon" 
+                    className="h-8 w-8 text-white hover:bg-white/20"
+                    onClick={toggleFullscreen}
+                  >
+                    <Maximize className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  <p>Fullscreen</p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+        </div>
+        
         {/* Progress bar */}
-        <div className="mb-2">
+        <div className="flex items-center gap-2 mb-2">
           <Slider
             value={[currentTime]}
-            min={0}
             max={duration || 100}
             step={0.1}
             onValueChange={handleTimeChange}
-            className="h-1"
+            className="cursor-pointer"
           />
         </div>
         
+        {/* Bottom controls */}
         <div className="flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 text-white"
+          <div className="flex items-center gap-2">
+            {/* Play/Pause button */}
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="h-8 w-8 text-white hover:bg-white/20"
               onClick={togglePlay}
             >
               {isPlaying ? (
                 <Pause className="h-4 w-4" />
               ) : (
-                <Play className="h-4 w-4" />
+                <Play className="h-4 w-4" fill="currentColor" />
               )}
             </Button>
             
-            <div className="flex items-center space-x-2">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8 text-white"
+            {/* Volume control */}
+            <div className="flex items-center">
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="h-8 w-8 text-white hover:bg-white/20"
                 onClick={toggleMute}
               >
-                {isMuted ? (
+                {isMuted || volume === 0 ? (
                   <VolumeX className="h-4 w-4" />
                 ) : (
                   <Volume2 className="h-4 w-4" />
@@ -369,47 +486,21 @@ export function S3VideoPlayer({ hlsUrl, poster, title, isHls = true }: VideoPlay
               <div className="w-20">
                 <Slider
                   value={[isMuted ? 0 : volume]}
-                  min={0}
                   max={1}
-                  step={0.01}
+                  step={0.05}
                   onValueChange={handleVolumeChange}
-                  className="h-1"
+                  className="cursor-pointer"
                 />
               </div>
             </div>
-            
-            <span className="text-xs text-white">
-              {formatTime(currentTime)} / {formatTime(duration)}
-            </span>
           </div>
           
-          <div className="flex items-center space-x-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 text-white"
-              onClick={toggleFullscreen}
-            >
-              <Maximize className="h-4 w-4" />
-            </Button>
-            
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 text-white"
-            >
-              <Settings className="h-4 w-4" />
-            </Button>
+          {/* Time display */}
+          <div className="text-white text-xs">
+            {formatTime(currentTime)} / {formatTime(duration)}
           </div>
         </div>
       </div>
-      
-      {/* Title overlay */}
-      {title && showControls && (
-        <div className="absolute top-0 left-0 right-0 p-4 bg-gradient-to-b from-black/80 to-transparent">
-          <h3 className="text-white font-medium">{title}</h3>
-        </div>
-      )}
     </div>
   );
 }

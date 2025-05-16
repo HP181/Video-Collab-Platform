@@ -1,691 +1,382 @@
+// src/components/S3MultipartUploadForm.tsx
 "use client";
 
 import { useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useForm } from "react-hook-form";
+import { useForm, FormProvider } from "react-hook-form";
 import * as z from "zod";
 import { useDropzone } from "react-dropzone";
-import { Upload, X, FileVideo } from "lucide-react";
+import { Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
-import { updateMultipartUploadParts } from "@/actions/video";
 
-// Define form validation schema
 const videoFormSchema = z.object({
-  title: z.string().min(3, {
-    message: "Title must be at least 3 characters.",
-  }).max(100, {
-    message: "Title cannot be longer than 100 characters."
-  }),
-  description: z.string().max(1000, {
-    message: "Description cannot be longer than 1000 characters."
-  }).optional(),
+  title: z.string().min(3).max(100),
+  description: z.string().max(1000).optional(),
 });
 
 type VideoFormValues = z.infer<typeof videoFormSchema>;
 
-type S3MultipartUploadFormProps = {
-  workspaceId: string;
-  onSuccess?: () => void;
-};
-
-// Constants for multipart upload
-const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
-
-export function S3MultipartUploadForm({ workspaceId, onSuccess }: S3MultipartUploadFormProps) {
+export function S3MultipartUploadForm({ workspaceId }: { workspaceId: string }) {
   const [open, setOpen] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [uploadId, setUploadId] = useState<string | null>(null);
-  const [videoId, setVideoId] = useState<string | null>(null);
-  const [key, setKey] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadedParts, setUploadedParts] = useState<{ ETag: string, PartNumber: number }[]>([]);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   
   const router = useRouter();
 
-  // Initialize form
   const form = useForm<VideoFormValues>({
     resolver: zodResolver(videoFormSchema),
-    defaultValues: {
-      title: "",
-      description: "",
-    },
+    defaultValues: { title: "", description: "" },
   });
 
-  // Dropzone setup
   const onDrop = useCallback((acceptedFiles: File[]) => {
-    if (acceptedFiles && acceptedFiles.length > 0) {
+    if (acceptedFiles.length > 0) {
       const file = acceptedFiles[0];
-      
-      // Validate file type
-      if (!file.type.startsWith('video/')) {
-        toast.error("Invalid file", {
-          description: "Please select a video file",
-        });
-        return;
-      }
-      
-      // Validate file size (e.g., limit to 2GB)
-      if (file.size > 2 * 1024 * 1024 * 1024) {
-        toast.error("File too large", {
-          description: "Please select a video file smaller than 2GB",
-        });
-        return;
-      }
-      
+      console.log("📁 File selected:", file.name);
       setSelectedFile(file);
-      
-      // Auto-populate title from filename if empty
-      const fileName = file.name.split(".")[0];
-      const formattedName = fileName
-        .replace(/[-_]/g, " ")
-        .replace(/\b\w/g, (c) => c.toUpperCase());
-      
-      if (!form.getValues("title")) {
-        form.setValue("title", formattedName);
-      }
+      const defaultTitle = file.name.split(".")[0].replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      form.setValue("title", defaultTitle);
     }
-  }, [form, toast]);
-  
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({ 
+  }, [form]);
+
+  const { getRootProps, getInputProps } = useDropzone({ 
     onDrop,
     accept: {
-      'video/*': ['.mp4', '.mov', '.avi', '.webm', '.mkv'],
+      'video/*': ['.mp4', '.mov', '.avi', '.webm']
     },
-    maxFiles: 1,
-    multiple: false,
+    maxFiles: 1
   });
 
-  // Calculate total chunks for a file
-  const calculateTotalChunks = (fileSize: number) => {
-    return Math.ceil(fileSize / CHUNK_SIZE);
-  };
-
-  // Initiate multipart upload
-  const initiateMultipartUpload = async (file: File, formValues: VideoFormValues) => {
+  const initiateMultipartUpload = async (file: File, values: VideoFormValues) => {
     try {
-      const response = await fetch('/api/videos/multipart/initiate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      console.log("🚀 Starting multipart upload...");
+      const response = await fetch("/api/videos/multipart/initiate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           fileName: file.name,
           fileType: file.type,
           fileSize: file.size,
           workspaceId,
-          title: formValues.title,
-          description: formValues.description,
-        }),
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to initiate upload');
-      }
-      
-      const data = await response.json();
-      return data;
-    } catch (error: any) {
-      console.error('Error initiating multipart upload:', error);
-      throw error;
-    }
-  };
-
- // Upload a single part
-  const uploadPart = async (
-    file: File,
-    uploadId: string,
-    key: string,
-    partNumber: number,
-    abortController: AbortController,
-    videoId: string  // Add videoId as a parameter
-  ) => {
-    console.log(`Uploading part ${partNumber}...`);
-    
-    try {
-      // Get a pre-signed URL for this part
-      console.log(`Requesting presigned URL for part ${partNumber}...`);
-      console.log(`Request params:`, { uploadId, key, videoId, partNumber });
-      
-      const response = await fetch('/api/videos/multipart/presigned', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadId,
-          key,
-          videoId,  // Make sure videoId is included here
-          partNumber,
-        }),
-      });
-      
-      if (!response.ok) {
-        console.error(`Error response from presigned URL API:`, response.status, response.statusText);
-        const errorText = await response.text();
-        console.error(`Error response body:`, errorText);
-        
-        let errorData;
-        try {
-          errorData = JSON.parse(errorText);
-        } catch (e) {
-          errorData = { error: errorText };
-        }
-        
-        throw new Error(errorData.error || `Failed to get presigned URL for part ${partNumber}: ${response.status} ${response.statusText}`);
-      }
-      
-      const data = await response.json();
-      console.log(`Got presigned URL for part ${partNumber}`);
-      
-      const { presignedUrl } = data;
-      
-      // Calculate chunk start and end positions
-      const start = (partNumber - 1) * CHUNK_SIZE;
-      const end = Math.min(file.size, start + CHUNK_SIZE);
-      const chunk = file.slice(start, end);
-      
-      console.log(`Uploading part ${partNumber} (${start}-${end}) directly to S3...`);
-      
-      // Upload the chunk to S3 - add mode: 'cors' to help with CORS issues
-      const uploadResponse = await fetch(presignedUrl, {
-        method: 'PUT',
-        body: chunk,
-        signal: abortController.signal,
-        mode: 'cors',
-        headers: {
-          'Content-Type': file.type,
-          'Content-Length': `${end - start}`,
-        }
-      });
-      
-      if (!uploadResponse.ok) {
-        throw new Error(`Failed to upload part ${partNumber}: ${uploadResponse.status} ${uploadResponse.statusText}`);
-      }
-      
-      console.log(`Part ${partNumber} uploaded successfully`);
-      
-      // Get the ETag from the response headers
-      const ETag = uploadResponse.headers.get('ETag')?.replace(/"/g, '') || '';
-      
-      if (!ETag) {
-        console.warn(`No ETag returned for part ${partNumber}, generating a fake one for testing`);
-        // If no ETag (might happen due to CORS), generate a fake one for testing
-        const fakeETag = `part${partNumber}-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
-        
-        // Update the server about this part
-        await updateMultipartUploadParts(videoId, uploadId, {
-          ETag: fakeETag, 
-          PartNumber: partNumber,
-        });
-        
-        return { ETag: fakeETag, PartNumber: partNumber };
-      }
-      
-      console.log(`Got ETag for part ${partNumber}: ${ETag}`);
-      
-      // Update the server about this part
-      await updateMultipartUploadParts(videoId, uploadId, {
-        ETag,
-        PartNumber: partNumber,
-      });
-      
-      return { ETag, PartNumber: partNumber };
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        console.log('Upload aborted by user');
-        throw new Error('Upload aborted by user');
-      }
-      console.error(`Error uploading part ${partNumber}:`, error);
-      throw error;
-    }
-  };
-  
-  // Complete multipart upload
-  const completeMultipartUpload = async (
-    uploadId: string,
-    key: string,
-    parts: { ETag: string, PartNumber: number }[]
-  ) => {
-    try {
-      const response = await fetch('/api/videos/multipart/complete', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadId,
-          key,
-          videoId,
-          parts,
-        }),
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to complete upload');
-      }
-      
-      return await response.json();
-    } catch (error: any) {
-      console.error('Error completing multipart upload:', error);
-      throw error;
-    }
-  };
-
-  // Cancel upload
-  const cancelUpload = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    
-    setIsUploading(false);
-    setUploadProgress(0);
-    setUploadedParts([]);
-    setUploadId(null);
-    setKey(null);
-    setVideoId(null);
-    
-    toast.warning("Upload cancelled",{
-      description: "Your video upload has been cancelled",
-    });
-  };
-
-  // Upload all parts
-      const uploadAllParts = async (file: File, uploadId: string, key: string, videoId: string) => {
-        const totalParts = calculateTotalChunks(file.size);
-        const parts: { ETag: string, PartNumber: number }[] = [];
-        
-        // Create a new abort controller
-        abortControllerRef.current = new AbortController();
-        
-        // Upload each part sequentially
-        for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
-          try {
-            const part = await uploadPart(file, uploadId, key, partNumber, abortControllerRef.current, videoId);
-            parts.push(part);
-            setUploadedParts(prev => [...prev, part]);
-            
-            // Update progress
-            setUploadProgress(Math.round((partNumber / totalParts) * 100));
-          } catch (error: any) {
-            if (error.message === 'Upload aborted by user') {
-              return null; // Upload was cancelled
-            }
-            throw error;
-          }
-        }
-        
-        return parts;
-      };
-
-  // Handle form submission
-  const onSubmit = async (values: VideoFormValues) => {
-    if (!selectedFile) {
-      toast.error("No file selected",{
-        description: "Please select a video file to upload",
-      });
-      return;
-    }
-    
-    setIsSubmitting(true);
-    setIsUploading(true);
-    setUploadProgress(0);
-    
-    try {
-      console.log("Starting upload process for file:", selectedFile.name);
-      
-      // Step 1: Initiate multipart upload
-      console.log("Initiating multipart upload...");
-      const initResponse = await fetch('/api/videos/multipart/initiate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fileName: selectedFile.name,
-          fileType: selectedFile.type,
-          fileSize: selectedFile.size,
-          workspaceId,
           title: values.title,
           description: values.description,
         }),
       });
-      
-      if (!initResponse.ok) {
-        let errorMessage = 'Failed to initiate upload';
-        try {
-          const errorData = await initResponse.json();
-          errorMessage = errorData.error || errorMessage;
-        } catch (e) {
-          console.error("Error parsing error response:", e);
-        }
-        throw new Error(errorMessage);
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to initiate upload");
       }
+
+      const data = await response.json();
+      console.log("✅ Multipart upload initiated:", data);
+      return data;
+    } catch (error) {
+      console.error("❌ Error initiating multipart upload:", error);
+      toast.error("Failed to initiate upload. Please try again.");
+      throw error;
+    }
+  };
+
+  const uploadPart = async (
+    partNumber: number, 
+    chunk: Blob, 
+    uploadId: string, 
+    key: string, 
+    videoId: string
+  ) => {
+    try {
+      console.log(`🚀 Requesting presigned URL for part ${partNumber}...`);
       
-      const initData = await initResponse.json();
-      console.log("Multipart upload initiated:", initData);
-      
-      // Save important data from response
-      const newUploadId = initData.uploadId;
-      const newKey = initData.key;
-      const newVideoId = initData.videoId;
-      
-      // Set state for these values
-      setUploadId(newUploadId);
-      setKey(newKey);
-      setVideoId(newVideoId);
-      
-      console.log("State updated with upload info:", { 
-        uploadId: newUploadId, 
-        key: newKey, 
-        videoId: newVideoId 
-      });
-      
-      // Validate that we have the necessary data
-      if (!newUploadId || !newKey || !newVideoId) {
-        throw new Error("Missing required upload data from server");
-      }
-      
-      // Step 2: Upload all parts
-      console.log("Beginning to upload parts...");
-      const totalChunks = calculateTotalChunks(selectedFile.size);
-      const parts: { ETag: string, PartNumber: number }[] = [];
-      
-      // Create a new abort controller
-      abortControllerRef.current = new AbortController();
-      
-      // Upload each part sequentially
-      for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
-        try {
-          console.log(`Uploading part ${partNumber} of ${totalChunks}...`);
-          
-          const part = await uploadPart(
-            selectedFile, 
-            newUploadId, 
-            newKey, 
-            partNumber, 
-            abortControllerRef.current,
-            newVideoId  // Pass the videoId here
-          );
-          
-          parts.push(part);
-          setUploadedParts(prev => [...prev, part]);
-          
-          // Update progress
-          setUploadProgress(Math.round((partNumber / totalChunks) * 100));
-          console.log(`Progress: ${Math.round((partNumber / totalChunks) * 100)}%`);
-        } catch (error: any) {
-          if (error.message === 'Upload aborted by user') {
-            console.log("Upload was aborted by user");
-            return;
-          }
-          throw error;
-        }
-      }
-      
-      if (parts.length === 0) {
-        throw new Error("No parts were uploaded successfully");
-      }
-      
-      // Step 3: Complete multipart upload
-      console.log("All parts uploaded. Completing multipart upload...");
-      const completeResponse = await fetch('/api/videos/multipart/complete', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      const presignedResponse = await fetch("/api/videos/multipart/presigned", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          uploadId: newUploadId,
-          key: newKey,
-          videoId: newVideoId,
+          uploadId,
+          key,
+          videoId,
+          partNumber,
+        }),
+      });
+
+      if (!presignedResponse.ok) {
+        const errorData = await presignedResponse.json();
+        throw new Error(errorData.error || `Failed to get presigned URL for part ${partNumber}`);
+      }
+
+      const { presignedUrl } = await presignedResponse.json();
+      console.log(`🔗 Received presigned URL for part ${partNumber}`);
+
+      // Create an abort controller for this request
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      const response = await fetch(presignedUrl, {
+        method: "PUT",
+        body: chunk,
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to upload part ${partNumber}: ${response.statusText}`);
+      }
+
+      const ETag = response.headers.get("ETag")?.replace(/"/g, "") || "";
+      console.log(`✅ Part ${partNumber} uploaded successfully. ETag: ${ETag}`);
+
+      return { ETag, PartNumber: partNumber };
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.log(`🛑 Upload of part ${partNumber} was aborted`);
+        return null;
+      }
+      console.error(`❌ Error uploading part ${partNumber}:`, error);
+      throw error;
+    }
+  };
+
+  const completeUpload = async (
+    uploadId: string, 
+    videoId: string, 
+    key: string, 
+    parts: { ETag: string; PartNumber: number }[]
+  ) => {
+    try {
+      console.log("🚀 Completing multipart upload...");
+      console.log("✅ Final parts list:", parts);
+
+      const response = await fetch("/api/videos/multipart/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          uploadId,
+          videoId,
+          key,
           parts,
         }),
       });
-      
-      if (!completeResponse.ok) {
-        let errorMessage = 'Failed to complete upload';
-        try {
-          const errorData = await completeResponse.json();
-          errorMessage = errorData.error || errorMessage;
-        } catch (e) {
-          // Ignore parse errors
-        }
-        throw new Error(errorMessage);
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to complete upload");
       }
-      
-      console.log("Upload completed successfully!");
-      
-      toast.success("Video uploaded",{
-        description: "Your video has been uploaded and is now processing.",
-      });
-      
-      // Reset form and state
-      form.reset();
-      setSelectedFile(null);
-      setUploadId(null);
-      setKey(null);
-      setVideoId(null);
-      setUploadedParts([]);
-      
-      // Close dialog
+
+      const data = await response.json();
+      console.log("✅ Multipart upload completed successfully:", data);
+      toast.success("Video upload completed successfully!");
       setOpen(false);
-      
-      // Call onSuccess callback if provided
-      if (onSuccess) {
-        onSuccess();
-      }
-      
-      // Refresh the workspace page
       router.refresh();
-    } catch (error: any) {
-      console.error("Upload error:", error);
-      toast.error("Upload Error",{
-        description: error.message || "An error occurred during upload",
-      });
-    } finally {
-      setIsUploading(false);
-      setIsSubmitting(false);
+    } catch (error) {
+      console.error("❌ Error completing multipart upload:", error);
+      toast.error("Upload failed. Please try again.");
+      throw error;
+    }
+  };
+
+  const cancelUpload = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
       abortControllerRef.current = null;
-    }
-  };
-
-  // Format file size
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) {
-      return `${bytes} B`;
-    } else if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(1)} KB`;
-    } else if (bytes < 1024 * 1024 * 1024) {
-      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    } else {
-      return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-    }
-  };
-
-  // Handle dialog close
-  const handleOpenChange = (open: boolean) => {
-    if (!open) {
-      // Reset form when closing
-      form.reset();
-      setSelectedFile(null);
-      setUploadProgress(0);
       setIsUploading(false);
-      setIsSubmitting(false);
-      setUploadId(null);
-      setKey(null);
-      setVideoId(null);
-      setUploadedParts([]);
-      
-      // Cancel any ongoing upload
-      if (isUploading) {
-        cancelUpload();
-      }
+      setUploadProgress(0);
+      toast.info("Upload cancelled");
     }
-    setOpen(open);
+  };
+
+  const onSubmit = async (values: VideoFormValues) => {
+    try {
+      if (!selectedFile) {
+        toast.error("Please select a file before uploading.");
+        return;
+      }
+
+      setIsUploading(true);
+      setUploadProgress(0);
+      
+      // Step 1: Initiate the multipart upload
+      const data = await initiateMultipartUpload(selectedFile, values);
+      const { uploadId, key, videoId } = data;
+
+      if (!uploadId || !key || !videoId) {
+        throw new Error("Invalid response from server when initiating upload");
+      }
+
+      // Step 2: Upload all parts
+      const chunkSize = 5 * 1024 * 1024; // 5MB
+      const totalChunks = Math.ceil(selectedFile.size / chunkSize);
+      console.log(`🗂️ Total chunks: ${totalChunks}`);
+
+      const parts: { ETag: string; PartNumber: number }[] = [];
+      
+      // Upload parts sequentially to avoid overwhelming the server
+      for (let i = 0; i < totalChunks; i++) {
+        if (!abortControllerRef.current) {
+          abortControllerRef.current = new AbortController();
+        }
+        
+        const partNumber = i + 1;
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, selectedFile.size);
+        const chunk = selectedFile.slice(start, end);
+        
+        console.log(`🚀 Uploading part ${partNumber}...`);
+        
+        const part = await uploadPart(partNumber, chunk, uploadId, key, videoId);
+        
+        if (part === null) {
+          // Upload was aborted
+          setIsUploading(false);
+          return;
+        }
+        
+        parts.push(part);
+        
+        // Update progress
+        setUploadProgress(Math.round((partNumber / totalChunks) * 100));
+      }
+
+      // Step 3: Complete the multipart upload
+      await completeUpload(uploadId, videoId, key, parts);
+      
+      // Reset state
+      setSelectedFile(null);
+      setIsUploading(false);
+      setUploadProgress(0);
+      form.reset();
+      
+    } catch (error) {
+      setIsUploading(false);
+      console.error("❌ Upload error:", error);
+      toast.error("Upload failed. Please try again.");
+    }
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
+    <Dialog open={open} onOpenChange={(newOpen) => {
+      if (!isUploading) {
+        setOpen(newOpen);
+        if (!newOpen) {
+          setSelectedFile(null);
+          setUploadProgress(0);
+          form.reset();
+        }
+      } else if (!newOpen) {
+        toast.info("Please wait for the upload to complete or cancel it first");
+      }
+    }}>
       <DialogTrigger asChild>
-        <Button>
-          <Upload className="mr-2 h-4 w-4" />
-          Upload Video
-        </Button>
+        <Button><Upload className="mr-2 h-4 w-4" /> Upload Video</Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-[550px]">
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Upload Video</DialogTitle>
-          <DialogDescription>
-            Upload a video to your workspace. The video will be processed and made available for viewing.
-          </DialogDescription>
         </DialogHeader>
-        
-        {/* File Selection */}
-        <div className="space-y-4">
-          {!selectedFile ? (
-            <div 
-              {...getRootProps()} 
-              className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition ${
-                isDragActive ? 'border-primary bg-primary/10' : 'hover:bg-muted/50'
-              }`}
-            >
-              <input {...getInputProps()} />
-              <FileVideo className="mx-auto h-10 w-10 text-muted-foreground mb-2" />
-              <p className="text-sm font-medium">
-                Drag & drop a video file here, or click to select
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">
-                MP4, WebM, MOV, AVI up to 2GB
-              </p>
-            </div>
-          ) : (
-            <div className="border rounded-md p-4 bg-muted/40 relative">
-              <div className="flex items-center">
-                <div className="w-12 h-12 bg-primary/10 rounded-lg flex items-center justify-center mr-4">
-                  <FileVideo className="h-6 w-6 text-primary" />
-                </div>
-                <div>
-                  <p className="font-medium truncate" title={selectedFile.name}>
-                    {selectedFile.name}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {formatFileSize(selectedFile.size)}
-                  </p>
-                </div>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="absolute top-2 right-2"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSelectedFile(null);
-                }}
-              >
-                <X className="h-4 w-4" />
-                <span className="sr-only">Remove</span>
-              </Button>
-            </div>
-          )}
-          
-          {isUploading && (
-            <div className="space-y-2">
-              <div className="flex justify-between text-sm">
-                <span>Uploading{uploadProgress < 100 ? '...' : ' - Finalizing'}</span>
-                <span>{uploadProgress}%</span>
-              </div>
-              <Progress value={uploadProgress} className="h-2" />
-              {uploadProgress < 100 && (
-                <div className="flex justify-end">
-                  <Button 
-                    variant="ghost" 
-                    size="sm" 
-                    onClick={cancelUpload}
-                    className="text-xs text-muted-foreground hover:text-destructive"
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        
-        {/* Video Details Form */}
-        <Form {...form}>
+        <FormProvider {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-            <FormField
-              control={form.control}
-              name="title"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Title</FormLabel>
-                  <FormControl>
-                    <Input placeholder="Enter video title" {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
+            <div>
+              <div {...getRootProps()} className="border-2 border-dashed rounded-md p-8 text-center cursor-pointer hover:bg-muted/50 transition">
+                <input {...getInputProps()} />
+                {selectedFile ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-center">
+                      <span className="font-medium truncate">{selectedFile.name}</span>
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        type="button" 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedFile(null);
+                        }}
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                      {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Upload className="mx-auto h-12 w-12 text-muted-foreground" />
+                    <p>Drag & drop a video file here, or click to select</p>
+                    <p className="text-xs text-muted-foreground">
+                      Supports MP4, MOV, AVI, and WEBM formats
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="title" className="text-sm font-medium">Title</label>
+              <Input
+                id="title"
+                {...form.register("title")}
+                placeholder="Enter video title"
+              />
+              {form.formState.errors.title && (
+                <p className="text-sm text-red-500">{form.formState.errors.title.message}</p>
               )}
-            />
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Description (optional)</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      placeholder="Add a description"
-                      className="resize-none"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="description" className="text-sm font-medium">Description (optional)</label>
+              <Textarea
+                id="description"
+                {...form.register("description")}
+                placeholder="Enter video description"
+                rows={3}
+              />
+              {form.formState.errors.description && (
+                <p className="text-sm text-red-500">{form.formState.errors.description.message}</p>
               )}
-            />
-            <DialogFooter>
+            </div>
+
+            {(uploadProgress > 0 || isUploading) && (
+              <div className="space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span>Upload Progress</span>
+                  <span>{uploadProgress}%</span>
+                </div>
+                <Progress value={uploadProgress} className="h-2" />
+              </div>
+            )}
+
+            <DialogFooter className="sm:justify-between">
+              {isUploading ? (
+                <Button type="button" variant="outline" onClick={cancelUpload}>
+                  Cancel Upload
+                </Button>
+              ) : (
+                <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+                  Cancel
+                </Button>
+              )}
               <Button 
                 type="submit" 
-                disabled={isSubmitting || !selectedFile || isUploading}
+                disabled={!selectedFile || isUploading}
+                className="min-w-24"
               >
-                {isSubmitting 
-                  ? uploadProgress < 100 
-                    ? "Uploading..." 
-                    : "Processing..." 
-                  : "Upload Video"
-                }
+                {isUploading ? "Uploading..." : "Upload Video"}
               </Button>
             </DialogFooter>
           </form>
-        </Form>
+        </FormProvider>
       </DialogContent>
     </Dialog>
   );
